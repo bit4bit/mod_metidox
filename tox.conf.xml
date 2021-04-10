@@ -1,0 +1,10 @@
+<configuration name="tox.conf" description="Tox">
+  <settings>
+    <param name="tox-name" value="freeswitch tox"/>
+    <param name="tox-status-message" value="freeswitch"/>
+    <param name="tox-profile" value="$${conf_dir}/tox-profile.tox"/>
+    <!--
+        <param name="destination" value="metidox"/>
+    -->
+  </settings>
+</configuration>
