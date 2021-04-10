@@ -23,3 +23,7 @@ Endpoint para freeswitch
 -[X] Receive call
 -[X] Send audio
 -[ ] Receive audio
+
+# CONTRIBUTING
+
+See https://chiselapp.com/user/bit4bit/repository/mod_metidox/index
