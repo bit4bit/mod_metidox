@@ -865,6 +865,7 @@ int new_inbound_channel(uint32_t friend_number)
 }
 
 void metidox_call_cb(ToxAV *av, uint32_t friend_number, bool audio_enabled, bool video_enabled, void *user_data) {
+	// answer inbound tox call or cancel
 	if (toxav_answer(av, friend_number, 64, 0, NULL))
 		new_inbound_channel(friend_number);
 	else
@@ -873,7 +874,7 @@ void metidox_call_cb(ToxAV *av, uint32_t friend_number, bool audio_enabled, bool
 }
 
 
-
+// apply changes of state calls
 void metidox_call_state_cb(ToxAV *av, uint32_t friend_number, uint32_t state, void *user_data)
 {
 	switch_channel_t *channel = NULL;
@@ -907,7 +908,7 @@ void metidox_call_state_cb(ToxAV *av, uint32_t friend_number, uint32_t state, vo
 	}
 }
 
-
+// print current tox id
 SWITCH_STANDARD_API(my_toxid)
 {
 	uint8_t tox_id_bin[TOX_ADDRESS_SIZE];
@@ -937,21 +938,25 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_metidox_load)
 	TOXAV_ERR_NEW av_error;
 	switch_api_interface_t *api_interface;
 
+	// alloc memory
 	module_pool = pool;
-
 	memset(&globals, 0, sizeof(globals));
 	memset(&toxcalls, 0, sizeof(toxcalls));
-	
+
+	// initialize globals from xml
 	load_config();
 
+	// instantiate module interface
 	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
 	metidox_endpoint_interface = switch_loadable_module_create_interface(*module_interface, SWITCH_ENDPOINT_INTERFACE);
 	metidox_endpoint_interface->interface_name = "metidox";
 	metidox_endpoint_interface->io_routines = &metidox_io_routines;
 	metidox_endpoint_interface->state_handler = &metidox_state_handlers;
 
+	// add custom apis
 	SWITCH_ADD_API(api_interface, "toxid", "Tox ID", my_toxid, "toxid");
 
+	// initialize tox
 	tox_options_default(&tox_options);
 	tox = load_tox(&tox_options, globals.tox_profile);
 	toxav = toxav_new(tox, &av_error);
@@ -959,13 +964,16 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_metidox_load)
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "toxav_new failed: %d\n", av_error);
 		return SWITCH_STATUS_FALSE;
 	}
+
+	// set tox callbacks
 	toxav_callback_call_state(toxav, &metidox_call_state_cb, NULL);
 	toxav_callback_call(toxav, &metidox_call_cb, NULL);
 	toxav_callback_audio_receive_frame(toxav, &metidox_audio_receive_frame_cb, NULL);
 	
 	tox_callback_friend_request(tox, metidox_friend_request_cb);
 	tox_callback_friend_status(tox, metidox_friend_status_cb);
-	
+
+	// start connection to tox
 	tox_self_set_name(tox, (uint8_t *)globals.tox_name, strlen(globals.tox_name), NULL);
 	tox_self_set_status_message(tox, (uint8_t*)globals.tox_status_message, strlen(globals.tox_status_message), NULL);
 	bootstrap_DHT(tox);
@@ -983,7 +991,8 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_metidox_load)
 	}
 
 
-	
+
+	// start thread for handling tox
 	{
 		switch_threadattr_t *toxav_thread_attr = NULL;
 		switch_threadattr_create(&toxav_thread_attr, module_pool);
