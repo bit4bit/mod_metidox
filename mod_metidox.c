@@ -28,7 +28,7 @@
 #define MIN(a, b) (a < b ? a : b)
 
 #define LOGA(KIND, ...)  switch_log_printf(SWITCH_CHANNEL_LOG, KIND, __VA_ARGS__ );
-#define SAMPLERATE_METIDOX 8000
+#define SAMPLERATE_METIDOX 48000
 
 SWITCH_MODULE_LOAD_FUNCTION(mod_metidox_load);
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_metidox_shutdown);
@@ -102,9 +102,6 @@ struct private_object {
 	unsigned int flags;
 	switch_codec_t read_codec;
 	switch_codec_t write_codec;
-	switch_frame_t read_frame;
-	switch_frame_t *tmp_read_frame;
-	unsigned char databuf[SWITCH_RECOMMENDED_BUFFER_SIZE];
 	switch_core_session_t *session;
 	switch_caller_profile_t *caller_profile;
 	switch_memory_pool_t *pool;
@@ -154,13 +151,11 @@ static switch_status_t metidox_codec(private_t *tech_pvt, int sample_rate, int c
 
 	if (switch_core_codec_init
 		//@TODO force 48000 tox sampling_rate
-		(&tech_pvt->read_codec, "L16", NULL, NULL, 48000, codec_ms, 1,
+		(&tech_pvt->read_codec, "L16", NULL, NULL, sample_rate, codec_ms, 1,
 		 SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE, NULL, NULL) != SWITCH_STATUS_SUCCESS) {
 		LOGA(SWITCH_LOG_ERROR, "Can't load codec?\n");
 		return SWITCH_STATUS_FALSE;
 	}
-	tech_pvt->read_frame.rate = 48000;
-	tech_pvt->read_frame.codec = &tech_pvt->read_codec;
 
 	if (switch_core_codec_init
 		(&tech_pvt->write_codec, "L16", NULL, NULL, sample_rate, codec_ms, 1,
@@ -183,8 +178,6 @@ static switch_status_t metidox_codec(private_t *tech_pvt, int sample_rate, int c
 
 static switch_status_t tech_init(private_t *tech_pvt, switch_core_session_t *session)
 {
-	tech_pvt->read_frame.data = tech_pvt->databuf;
-	tech_pvt->read_frame.buflen = sizeof(tech_pvt->databuf);
 	switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, switch_core_session_get_pool(session));
 	switch_mutex_init(&tech_pvt->flag_mutex, SWITCH_MUTEX_NESTED, switch_core_session_get_pool(session));
 	switch_queue_create(&tech_pvt->frame_queue, FRAME_QUEUE_LEN, switch_core_session_get_pool(session));
@@ -224,10 +217,10 @@ static switch_status_t channel_on_init(switch_core_session_t *session)
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "channel_on_init\n");
 	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	switch_assert(tech_pvt != NULL);
 
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 	switch_set_flag_locked(tech_pvt, TFLAG_IO);
 
 	switch_mutex_lock(globals.mutex);
@@ -245,10 +238,10 @@ static switch_status_t channel_on_routing(switch_core_session_t *session)
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "channel_on_routing\n");
 	
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
 	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	switch_assert(tech_pvt != NULL);
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "%s CHANNEL ROUTING\n", switch_channel_get_name(channel));
 
@@ -263,10 +256,10 @@ static switch_status_t channel_on_execute(switch_core_session_t *session)
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "channel_on_execute\n");
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
 	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	switch_assert(tech_pvt != NULL);
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "%s CHANNEL EXECUTE\n", switch_channel_get_name(channel));
 
@@ -281,7 +274,7 @@ static switch_status_t channel_on_destroy(switch_core_session_t *session)
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "channel_on_destroy\n");
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
 	tech_pvt = switch_core_session_get_private(session);
 
@@ -293,8 +286,12 @@ static switch_status_t channel_on_destroy(switch_core_session_t *session)
 		if (switch_core_codec_ready(&tech_pvt->write_codec)) {
 			switch_core_codec_destroy(&tech_pvt->write_codec);
 		}
-
+		
+		switch_core_timer_destroy(&tech_pvt->timer_read);
+		
 		switch_core_destroy_memory_pool(&tech_pvt->pool);
+		
+		switch_core_session_set_private(session, NULL);
 	}
 
 	return SWITCH_STATUS_SUCCESS;
@@ -308,18 +305,20 @@ static switch_status_t channel_on_hangup(switch_core_session_t *session)
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "channel_on_hangup\n");
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
 	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	switch_assert(tech_pvt != NULL);
 
-	switch_clear_flag_locked(tech_pvt, TFLAG_IO);
-	switch_clear_flag_locked(tech_pvt, TFLAG_VOICE);
-	switch_set_flag_locked(tech_pvt, TFLAG_HANGUP);
-	//switch_thread_cond_signal(tech_pvt->cond);
-
+	switch_mutex_lock(tech_pvt->flag_mutex);
+	switch_clear_flag(tech_pvt, TFLAG_IO);
+	switch_clear_flag(tech_pvt, TFLAG_VOICE);
+	switch_set_flag(tech_pvt, TFLAG_HANGUP);
+	switch_mutex_unlock(tech_pvt->flag_mutex);
+	
 	toxav_call_control(tech_pvt->toxav, tech_pvt->friend_number,
 					   TOXAV_CALL_CONTROL_CANCEL, NULL);
+	
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "%s CHANNEL HANGUP\n", switch_channel_get_name(channel));
 	switch_mutex_lock(globals.mutex);
 	globals.calls--;
@@ -328,6 +327,7 @@ static switch_status_t channel_on_hangup(switch_core_session_t *session)
 	}
 	switch_mutex_unlock(globals.mutex);
 
+	LOGA(SWITCH_LOG_INFO, "channel on hangup done\n");
 	return SWITCH_STATUS_SUCCESS;
 }
 
@@ -338,18 +338,23 @@ static switch_status_t channel_kill_channel(switch_core_session_t *session, int 
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "channel_kill_channel sig %d\n", sig);
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
 	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	switch_assert(tech_pvt != NULL);
 
 	switch (sig) {
 	case SWITCH_SIG_KILL:
-		switch_clear_flag_locked(tech_pvt, TFLAG_IO);
-		switch_clear_flag_locked(tech_pvt, TFLAG_VOICE);
+		switch_mutex_lock(tech_pvt->flag_mutex);
+		switch_clear_flag(tech_pvt, TFLAG_IO);
+		switch_clear_flag(tech_pvt, TFLAG_VOICE);
 		switch_set_flag(tech_pvt, TFLAG_HANGUP);
-
+		switch_mutex_unlock(tech_pvt->flag_mutex);
 		break;
+	case SWITCH_SIG_BREAK:
+		switch_mutex_lock(tech_pvt->flag_mutex);
+		switch_set_flag(tech_pvt,TFLAG_BREAK);
+		switch_mutex_unlock(tech_pvt->flag_mutex);
 	default:
 		break;
 	}
@@ -377,17 +382,17 @@ static switch_status_t channel_send_dtmf(switch_core_session_t *session, const s
 	return SWITCH_STATUS_SUCCESS;
 }
 
+// bit4bit(FIXME): not works why?
 static switch_status_t channel_read_frame(switch_core_session_t *session, switch_frame_t **frame, switch_io_flag_t flags, int stream_id)
 {
 	switch_channel_t *channel = NULL;
 	private_t *tech_pvt = NULL;
-	switch_byte_t *data;
 	
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
 	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	switch_assert(tech_pvt != NULL);
 
 	if (!switch_channel_ready(channel) || !switch_test_flag(tech_pvt, TFLAG_IO)) {
 		LOGA(SWITCH_LOG_ERROR, "channel not ready\n");
@@ -395,17 +400,14 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 	}
 
 	if (switch_test_flag(tech_pvt, TFLAG_HANGUP)) {
-		LOGA(SWITCH_LOG_INFO, "tflag hangup\n");
+		LOGA(SWITCH_LOG_ERROR, "tflag hangup\n");
 		return SWITCH_STATUS_FALSE;
 	}
 
-	tech_pvt->read_frame.datalen = 0;
-	tech_pvt->read_frame.flags = SFF_NONE;
+
 	*frame = NULL;
 
 	while (switch_test_flag(tech_pvt, TFLAG_IO)) {
-		tech_pvt->read_frame.datalen = 0;
-		tech_pvt->read_frame.flags = SFF_NONE;
 
 		if (switch_test_flag(tech_pvt, TFLAG_HANGUP)) {
 			LOGA(SWITCH_LOG_INFO, "tflag hangup\n");
@@ -413,7 +415,7 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 		}
 			
 		if (switch_test_flag(tech_pvt, TFLAG_BREAK)) {
-			switch_clear_flag(tech_pvt, TFLAG_BREAK);
+			switch_clear_flag_locked(tech_pvt, TFLAG_BREAK);
 			LOGA(SWITCH_LOG_INFO, "break channel\n");
 			goto cng;
 		}
@@ -423,39 +425,42 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 			return SWITCH_STATUS_FALSE;
 		}
 
+		if (switch_test_flag(tech_pvt, TFLAG_IO) && switch_test_flag(tech_pvt, TFLAG_VOICE))
 		{
-			void *pop;
+			void *pop = NULL;
+			switch_frame_t * current_frame = NULL;
 			if (switch_queue_trypop(tech_pvt->frame_queue, &pop) == SWITCH_STATUS_SUCCESS && pop) {
-				switch_clear_flag_locked(tech_pvt, TFLAG_VOICE);
-				if (tech_pvt->tmp_read_frame) {
-					switch_frame_free(&tech_pvt->tmp_read_frame);
-				}
-				tech_pvt->tmp_read_frame = (switch_frame_t *) pop;
-				tech_pvt->tmp_read_frame->codec = &tech_pvt->read_codec;
-				*frame = tech_pvt->tmp_read_frame;	
-			} else {
-				continue;
-			}
-		}
+				current_frame = (switch_frame_t *) pop;
+				switch_assert(current_frame != NULL);
+				
+				switch_mutex_lock(tech_pvt->flag_mutex);
+				switch_clear_flag(tech_pvt, TFLAG_VOICE);
+				switch_mutex_unlock(tech_pvt->flag_mutex);
+
+				if (!current_frame->datalen)
+					continue;
+
+				*frame = current_frame;
 
 #if SWITCH_BYTE_ORDER == __BIG_ENDIAN
-		if (switch_test_flag(tech_pvt, TFLAG_LINEAR)) {
-			switch_swap_linear((*frame)->data, (int) (*frame)->datalen / 2);
-		}
+					if (switch_test_flag(tech_pvt, TFLAG_LINEAR)) {
+						switch_swap_linear((*frame)->data, (int) (*frame)->datalen / 2);
+					}
 #endif
-		LOGA(SWITCH_LOG_INFO, "channel read TFLAG_VOICE\n");
-		return SWITCH_STATUS_SUCCESS;
+
+					LOGA(SWITCH_LOG_INFO, "metidox_audio from queue sampling rate: %d channels: %d sample_count: %d\n", current_frame->rate, current_frame->channels, current_frame->samples);
+					return SWITCH_STATUS_SUCCESS;
+			}
+			
+		}
+		
+		
+		//LOGA(SWITCH_LOG_INFO, "channel read TFLAG_VOICE\n");
+		switch_cond_next();
 	}
 
   cng:
-	data = (switch_byte_t *) tech_pvt->read_frame.data;
-	data[0] = 65;
-	data[1] = 0;
-	tech_pvt->read_frame.datalen = 2;
-	tech_pvt->read_frame.flags = SFF_CNG;
-	*frame = &tech_pvt->read_frame;
-	return SWITCH_STATUS_SUCCESS;
-
+	return SWITCH_STATUS_FALSE;
 }
 
 static switch_status_t channel_write_frame(switch_core_session_t *session, switch_frame_t *frame, switch_io_flag_t flags, int stream_id)
@@ -465,10 +470,10 @@ static switch_status_t channel_write_frame(switch_core_session_t *session, switc
 
 
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
 	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	switch_assert(tech_pvt != NULL);
 
 
 	if (!switch_channel_ready(channel) || !switch_test_flag(tech_pvt, TFLAG_IO)) {
@@ -510,11 +515,17 @@ static switch_status_t channel_answer_channel(switch_core_session_t *session)
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "channel_answer_channel\n");
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
 	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	switch_assert(tech_pvt != NULL);
 
+	switch_set_flag_locked(tech_pvt, TFLAG_IO);
+
+	switch_mutex_lock(globals.mutex);
+	globals.calls++;
+	switch_mutex_unlock(globals.mutex);
+	
 	return SWITCH_STATUS_SUCCESS;
 }
 
@@ -526,10 +537,10 @@ static switch_status_t channel_receive_message(switch_core_session_t *session, s
 
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "channel_receive_message: message_id %d\n", msg->message_id);
 	channel = switch_core_session_get_channel(session);
-	assert(channel != NULL);
+	switch_assert(channel != NULL);
 
 	tech_pvt = (private_t *) switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	switch_assert(tech_pvt != NULL);
 
 	switch (msg->message_id) {
 	case SWITCH_MESSAGE_INDICATE_ANSWER:
@@ -597,6 +608,9 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "failed to get friend_number: %d\n", toxerr);
 				return SWITCH_CAUSE_DESTINATION_OUT_OF_ORDER;
 			}
+
+			switch_set_flag_locked(tech_pvt, TFLAG_OUTBOUND);
+			switch_channel_set_state(channel, CS_INIT);
 			toxav_call(toxav, friend_number, 64, 0, (TOXAV_ERR_CALL*)&toxerr);
 
 			if (toxerr != TOXAV_ERR_CALL_OK) {
@@ -608,6 +622,9 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 			toxcalls.session[friend_number] = *new_session;
 			//toxcalls.session_uuid[friend_number] = switch_core_session_strdup(session, (char *)&session_uuid);
 			switch_mutex_unlock(toxcalls.mutex);
+
+
+			switch_channel_mark_ring_ready(channel);
 		} else {
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(*new_session), SWITCH_LOG_ERROR, "Doh! no caller profile\n");
 			switch_core_session_destroy(new_session);
@@ -615,9 +632,6 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 		}
 
 
-		switch_set_flag_locked(tech_pvt, TFLAG_OUTBOUND);
-		switch_channel_set_state(channel, CS_INIT);
-		switch_channel_mark_ring_ready(channel);
 		return SWITCH_CAUSE_SUCCESS;
 	}
 
@@ -774,38 +788,32 @@ void metidox_audio_receive_frame_cb(ToxAV *av, uint32_t friend_number, const int
 									uint8_t channels, uint32_t sampling_rate, void *user_data) {
 	switch_core_session_t *session = NULL;
 	private_t *tech_pvt = NULL;
-	//size_t length = sample_count * channels;
+	switch_frame_t *frame = NULL;
+	size_t length = sample_count * channels;
 
 	switch_mutex_lock(toxcalls.mutex);
 	session = toxcalls.session[friend_number];
 	switch_mutex_unlock(toxcalls.mutex);
-	assert(session != NULL);
+	switch_assert(session != NULL);
 
 	tech_pvt = switch_core_session_get_private(session);
-	assert(tech_pvt != NULL);
+	switch_assert(tech_pvt != NULL);
 	
-	LOGA(SWITCH_LOG_INFO, "metidox_audio_receive_frame_cb for sampling_rate %d channels %d sample_count %d\n", (int)sampling_rate, (int)channels, (int)sample_count);
-	//LOGA(SWITCH_LOG_INFO, "metidox_audio_receive_frame_cb for friend %d\n", friend_number);
-	//LOGA(SWITCH_LOG_INFO, "metidox_audio_receive_frame_cb for sample_count %d channels %d\n", (int)sample_count, channels);
-
-	int length = sample_count * 2 * channels;
-
-	tech_pvt->read_frame.datalen = length;
-	tech_pvt->read_frame.channels = channels;
-	tech_pvt->read_frame.samples = sample_count;
-	tech_pvt->read_frame.rate = sampling_rate;
-	tech_pvt->read_frame.timestamp = tech_pvt->timer_read.samplecount;
-	//LOGA(SWITCH_LOG_INFO, "Frame send to FS length %u\n", length);
-	memcpy(tech_pvt->read_frame.data, pcm, sizeof(int16_t) * length);
-	{
-		switch_frame_t *clone;
-		if (switch_frame_dup(&tech_pvt->read_frame, &clone) != SWITCH_STATUS_SUCCESS) {
-			abort();
-		}
-		
-		if (switch_queue_trypush(tech_pvt->frame_queue, clone) == SWITCH_STATUS_SUCCESS) {
-			switch_set_flag_locked(tech_pvt, TFLAG_VOICE);
-		}
+	
+	switch_assert(switch_frame_alloc(&frame, sizeof(int16_t) * length) == SWITCH_STATUS_SUCCESS);
+	memcpy(frame->data, pcm, sizeof(int16_t) * length);
+	
+	frame->datalen = length * 2; //two bytes
+	frame->channels = channels;
+	frame->samples = sample_count;
+	frame->rate = sampling_rate;
+	frame->timestamp = tech_pvt->timer_read.samplecount;
+	frame->codec = &tech_pvt->read_codec;
+	
+	if (switch_queue_trypush(tech_pvt->frame_queue, frame) == SWITCH_STATUS_SUCCESS) {
+		switch_set_flag_locked(tech_pvt, TFLAG_VOICE);
+	} else {
+		LOGA(SWITCH_LOG_INFO, "failed to push frame on queue");
 	}
 }
 
@@ -815,8 +823,8 @@ int new_inbound_channel(uint32_t friend_number)
 	switch_core_session_t *session = NULL;
 	switch_channel_t *channel = NULL;
 	private_t * tech_pvt = NULL;
-	switch_mutex_lock(toxcalls.mutex);
 	
+	// create a session inbound
 	if ((toxcalls.session[friend_number] = switch_core_session_request(metidox_endpoint_interface, SWITCH_CALL_DIRECTION_INBOUND, SOF_NONE, NULL)) != 0) {
 		session = toxcalls.session[friend_number];
 		
@@ -854,13 +862,15 @@ int new_inbound_channel(uint32_t friend_number)
 			return SWITCH_STATUS_FALSE;
 		}
 		
-		switch_channel_set_state(channel, CS_INIT);
 		if (switch_core_session_thread_launch(session) != SWITCH_STATUS_SUCCESS) {
 			LOGA(SWITCH_LOG_ERROR, "Error spawing thread\n");
 			switch_core_session_destroy(&session);
-			return SWITCH_STATUS_SUCCESS;
+			return SWITCH_STATUS_FALSE;
 		}
 	}
+
+	switch_channel_set_state(channel, CS_INIT);
+
 	return SWITCH_STATUS_SUCCESS;
 }
 
@@ -896,15 +906,23 @@ void metidox_call_state_cb(ToxAV *av, uint32_t friend_number, uint32_t state, vo
 
 	if (state & TOXAV_FRIEND_CALL_STATE_FINISHED) {
 		LOGA(SWITCH_LOG_INFO, "TOX CALL FRIEND FINISHED\n");
+
+		switch_set_flag_locked(tech_pvt, TFLAG_HANGUP);
 		switch_channel_hangup(channel, SWITCH_CAUSE_NORMAL_CLEARING);
 	} else if (state & TOXAV_FRIEND_CALL_STATE_ERROR) {
+		switch_set_flag_locked(tech_pvt, TFLAG_HANGUP);
 		switch_channel_hangup(channel, SWITCH_CAUSE_NORMAL_TEMPORARY_FAILURE);
 	} else if (state & TOXAV_FRIEND_CALL_STATE_ACCEPTING_A) {
+
 		LOGA(SWITCH_LOG_INFO, "TOX CALL FRIEND ANSWERED");
 		switch_channel_mark_answered(channel);
 	} else if (state && TOXAV_FRIEND_CALL_STATE_SENDING_A) {
 		LOGA(SWITCH_LOG_INFO, "TOX FRIEND IS CALLING");
 		toxav_call_control(av, friend_number, TOXAV_CALL_CONTROL_RESUME, NULL);
+	} else {
+		LOGA(SWITCH_LOG_ERROR, "UNKOWN HOW HANDLE TOXAV STATE");
+		switch_set_flag_locked(tech_pvt, TFLAG_HANGUP);
+		switch_channel_hangup(channel, SWITCH_CAUSE_NORMAL_TEMPORARY_FAILURE);
 	}
 }
 
@@ -1026,6 +1044,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_metidox_shutdown)
 	while (x) {
 		x--;
 		switch_yield(5000);
+		switch_cond_next();
 	}
 
 	{
@@ -1038,6 +1057,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_metidox_shutdown)
 	while (x) {
 		x--;
 		switch_yield(5000);
+		switch_cond_next();
 	}
 	
 	/* Free dynamically allocated strings */
