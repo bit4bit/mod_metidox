@@ -109,7 +109,9 @@ struct private_object {
 	switch_mutex_t *mutex;
 	switch_mutex_t *flag_mutex;
 
-	switch_queue_t *frame_queue;
+	// Embedded frame for audio receive (replaces queue)
+	switch_frame_t read_frame;
+	unsigned char databuf[SWITCH_RECOMMENDED_BUFFER_SIZE];
 };
 
 typedef struct private_object private_t;
@@ -180,10 +182,16 @@ static switch_status_t tech_init(private_t *tech_pvt, switch_core_session_t *ses
 {
 	switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, switch_core_session_get_pool(session));
 	switch_mutex_init(&tech_pvt->flag_mutex, SWITCH_MUTEX_NESTED, switch_core_session_get_pool(session));
-	switch_queue_create(&tech_pvt->frame_queue, FRAME_QUEUE_LEN, switch_core_session_get_pool(session));
 	switch_core_session_set_private(session, tech_pvt);
 	tech_pvt->session = session;
 	tech_pvt->toxav = toxav;
+	
+	// Initialize embedded frame with static buffer
+	memset(&tech_pvt->read_frame, 0, sizeof(tech_pvt->read_frame));
+	tech_pvt->read_frame.data = tech_pvt->databuf;
+	tech_pvt->read_frame.buflen = sizeof(tech_pvt->databuf);
+	tech_pvt->read_frame.flags = SFF_NONE;
+	
 	if (switch_core_new_memory_pool(&tech_pvt->pool) != SWITCH_STATUS_SUCCESS ){
 		LOGA(SWITCH_LOG_ERROR, "metidox_codec failde switch_core_new_memory_pool\n");
 		return SWITCH_STATUS_FALSE;
@@ -382,12 +390,12 @@ static switch_status_t channel_send_dtmf(switch_core_session_t *session, const s
 	return SWITCH_STATUS_SUCCESS;
 }
 
-// bit4bit(FIXME): not works why?
 static switch_status_t channel_read_frame(switch_core_session_t *session, switch_frame_t **frame, switch_io_flag_t flags, int stream_id)
 {
 	switch_channel_t *channel = NULL;
 	private_t *tech_pvt = NULL;
-	
+	switch_byte_t *data;
+
 	channel = switch_core_session_get_channel(session);
 	switch_assert(channel != NULL);
 
@@ -404,8 +412,8 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 		return SWITCH_STATUS_FALSE;
 	}
 
-
 	*frame = NULL;
+	tech_pvt->read_frame.flags = SFF_NONE;
 
 	while (switch_test_flag(tech_pvt, TFLAG_IO)) {
 
@@ -427,40 +435,34 @@ static switch_status_t channel_read_frame(switch_core_session_t *session, switch
 
 		if (switch_test_flag(tech_pvt, TFLAG_IO) && switch_test_flag(tech_pvt, TFLAG_VOICE))
 		{
-			void *pop = NULL;
-			switch_frame_t * current_frame = NULL;
-			if (switch_queue_trypop(tech_pvt->frame_queue, &pop) == SWITCH_STATUS_SUCCESS && pop) {
-				current_frame = (switch_frame_t *) pop;
-				switch_assert(current_frame != NULL);
-				
-				switch_mutex_lock(tech_pvt->flag_mutex);
-				switch_clear_flag(tech_pvt, TFLAG_VOICE);
-				switch_mutex_unlock(tech_pvt->flag_mutex);
-
-				if (!current_frame->datalen)
-					continue;
-
-				*frame = current_frame;
+			switch_clear_flag_locked(tech_pvt, TFLAG_VOICE);
+			if (!tech_pvt->read_frame.datalen) {
+				continue;
+			}
+			*frame = &tech_pvt->read_frame;
 
 #if SWITCH_BYTE_ORDER == __BIG_ENDIAN
-					if (switch_test_flag(tech_pvt, TFLAG_LINEAR)) {
-						switch_swap_linear((*frame)->data, (int) (*frame)->datalen / 2);
-					}
+			if (switch_test_flag(tech_pvt, TFLAG_LINEAR)) {
+				switch_swap_linear((*frame)->data, (int) (*frame)->datalen / 2);
+			}
 #endif
 
-					LOGA(SWITCH_LOG_INFO, "metidox_audio from queue sampling rate: %d channels: %d sample_count: %d\n", current_frame->rate, current_frame->channels, current_frame->samples);
-					return SWITCH_STATUS_SUCCESS;
-			}
-			
+			LOGA(SWITCH_LOG_DEBUG, "metidox_audio read_frame datalen: %d rate: %d channels: %d samples: %d\n", 
+				tech_pvt->read_frame.datalen, tech_pvt->read_frame.rate, tech_pvt->read_frame.channels, tech_pvt->read_frame.samples);
+			return SWITCH_STATUS_SUCCESS;
 		}
 		
-		
-		//LOGA(SWITCH_LOG_INFO, "channel read TFLAG_VOICE\n");
 		switch_cond_next();
 	}
 
   cng:
-	return SWITCH_STATUS_FALSE;
+	data = (switch_byte_t *) tech_pvt->read_frame.data;
+	data[0] = 65;
+	data[1] = 0;
+	tech_pvt->read_frame.datalen = 2;
+	tech_pvt->read_frame.flags = SFF_CNG;
+	*frame = &tech_pvt->read_frame;
+	return SWITCH_STATUS_SUCCESS;
 }
 
 static switch_status_t channel_write_frame(switch_core_session_t *session, switch_frame_t *frame, switch_io_flag_t flags, int stream_id)
@@ -788,33 +790,42 @@ void metidox_audio_receive_frame_cb(ToxAV *av, uint32_t friend_number, const int
 									uint8_t channels, uint32_t sampling_rate, void *user_data) {
 	switch_core_session_t *session = NULL;
 	private_t *tech_pvt = NULL;
-	switch_frame_t *frame = NULL;
-	size_t length = sample_count * channels;
+	size_t length = sample_count * channels * sizeof(int16_t);
 
 	switch_mutex_lock(toxcalls.mutex);
 	session = toxcalls.session[friend_number];
 	switch_mutex_unlock(toxcalls.mutex);
-	switch_assert(session != NULL);
+	
+	if (session == NULL) {
+		LOGA(SWITCH_LOG_WARNING, "No session found for friend_number %d\n", friend_number);
+		return;
+	}
 
 	tech_pvt = switch_core_session_get_private(session);
-	switch_assert(tech_pvt != NULL);
-	
-	
-	switch_assert(switch_frame_alloc(&frame, sizeof(int16_t) * length) == SWITCH_STATUS_SUCCESS);
-	memcpy(frame->data, pcm, sizeof(int16_t) * length);
-	
-	frame->datalen = length * 2; //two bytes
-	frame->channels = channels;
-	frame->samples = sample_count;
-	frame->rate = sampling_rate;
-	frame->timestamp = tech_pvt->timer_read.samplecount;
-	frame->codec = &tech_pvt->read_codec;
-	
-	if (switch_queue_trypush(tech_pvt->frame_queue, frame) == SWITCH_STATUS_SUCCESS) {
-		switch_set_flag_locked(tech_pvt, TFLAG_VOICE);
-	} else {
-		LOGA(SWITCH_LOG_INFO, "failed to push frame on queue");
+	if (tech_pvt == NULL) {
+		LOGA(SWITCH_LOG_WARNING, "No tech_pvt found for session\n");
+		return;
 	}
+	
+	// Copy audio data into embedded frame buffer
+	if (length > sizeof(tech_pvt->databuf)) {
+		LOGA(SWITCH_LOG_WARNING, "Audio frame too large: %zu bytes, truncating to %zu\n", length, sizeof(tech_pvt->databuf));
+		length = sizeof(tech_pvt->databuf);
+	}
+	
+	memcpy(tech_pvt->databuf, pcm, length);
+	
+	tech_pvt->read_frame.datalen = length;
+	tech_pvt->read_frame.channels = channels;
+	tech_pvt->read_frame.samples = sample_count;
+	tech_pvt->read_frame.rate = sampling_rate;
+	tech_pvt->read_frame.timestamp = tech_pvt->timer_read.samplecount;
+	tech_pvt->read_frame.codec = &tech_pvt->read_codec;
+	tech_pvt->read_frame.flags = SFF_NONE;
+	tech_pvt->read_frame.source = "metidox";
+	tech_pvt->read_frame.buflen = length;
+	
+	switch_set_flag_locked(tech_pvt, TFLAG_VOICE);
 }
 
 
